@@ -13,10 +13,11 @@ import (
 
 	"github.com/go-redis/redis/v8"
 	"github.com/google/uuid"
+	"github.com/spf13/cast"
+
 	"github.com/hibiken/asynq/internal/base"
 	"github.com/hibiken/asynq/internal/errors"
 	"github.com/hibiken/asynq/internal/timeutil"
-	"github.com/spf13/cast"
 )
 
 const statsTTL = 90 * 24 * time.Hour // 90 days
@@ -128,6 +129,63 @@ func (r *RDB) Enqueue(ctx context.Context, msg *base.TaskMessage) error {
 	if err != nil {
 		return err
 	}
+	if n == 0 {
+		return errors.E(op, errors.AlreadyExists, errors.ErrTaskIdConflict)
+	}
+	return nil
+}
+
+var enqueueBatchCmd = redis.NewScript(`
+local res = {}
+for i=1, table.getn(KEYS)/2, 1
+do
+	local j = 2*i-1
+    local k = i+j-1
+	if redis.call("EXISTS", KEYS[j]) == 1 then
+		res[i] = 0
+    else
+		redis.call("HSET", KEYS[j],
+					"msg", ARGV[k],
+					"state", "pending",
+					"pending_since", ARGV[k+2])
+		redis.call("LPUSH", KEYS[j+1], ARGV[k+1])
+		res[j] = 1
+	end
+	v = v+3
+end
+return res
+`)
+
+// EnqueueBatch adds the given list of tasks to the pending list of the queue.
+func (r *RDB) EnqueueBatch(ctx context.Context, msgs []*base.TaskMessage) error {
+	var op errors.Op = "rdb.EnqueueBatch"
+
+	queueNameSet := make(map[string]struct{})
+	for _, msg := range msgs {
+		if _, exists := queueNameSet[msg.Queue]; !exists {
+			queueNameSet[msg.Queue] = struct{}{}
+			if err := r.client.SAdd(ctx, base.AllQueues, msg.Queue).Err(); err != nil {
+				return errors.E(op, errors.Unknown, &errors.RedisCommandError{Command: "sadd", Err: err})
+			}
+		}
+	}
+
+	var keys []string
+	var argv []interface{}
+
+	for _, msg := range msgs {
+		encoded, err := base.EncodeMessage(msg)
+		if err != nil {
+			return errors.E(op, errors.Unknown, fmt.Sprintf("cannot encode message: %v", err))
+		}
+		keys = append(keys, base.TaskKey(msg.Queue, msg.ID), base.PendingKey(msg.Queue))
+		argv = append(argv, encoded, msg.ID, r.clock.Now().UnixNano())
+	}
+	n, err := r.runScriptWithErrorCode(ctx, op, enqueueBatchCmd, keys, argv...)
+	if err != nil {
+		return err
+	}
+	// handle with a list of int?
 	if n == 0 {
 		return errors.E(op, errors.AlreadyExists, errors.ErrTaskIdConflict)
 	}
